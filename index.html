@@ -109,10 +109,6 @@ function draw() {
   ctx.fillRect(0, 0, cv.width, cv.height);
 
   for (let i = 0; i < hand.length; i++) drawCard(i);
-
-  const n = hand.filter(c => c.selected).length;
-  document.getElementById('status').textContent =
-    n ? `${n} selected` : 'click a card to select';
 }
 
 // --- input ------------------------------------------------------------------

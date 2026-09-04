@@ -24,52 +24,141 @@ const cv  = document.getElementById('c');
 const ctx = cv.getContext('2d');
 
 const CARD_W = 100, CARD_H = 100, GAP = 15;
+const COLS = 3, SLOTS = 6;
+const HAND_MAX_W = 900;   // hands fan inward past this, rather than overflowing
+const SIDES = ['top', 'bottom'];
+
+// field[0..2] is always the frontline and field[3..5] the backline, on BOTH
+// sides. Only slotPos() knows that a top-side frontline draws lower on screen
+// than its backline — every rule downstream can just ask `index < COLS`.
+function isFront(index) { return index < COLS; }
+
+// Rows mirror about the centre line, so the two frontlines face each other.
+const ROW_Y = {
+  top:    { hand:  26, front: 262, back: 150 },
+  bottom: { hand: 642, front: 406, back: 518 },
+};
+
+const FIELD_X = (cv.width - (COLS * CARD_W + (COLS - 1) * GAP)) / 2;
+const DECK_X  = FIELD_X + COLS * (CARD_W + GAP) + 40;
 
 // --- state ------------------------------------------------------------------
 
-let hand  = [];
-let hover = -1;
+let nextId = 1;
 
-function freshDeck() {
-  const d = [];
-  for (let i = 0; i < 10; i++) {
-    d.push({ selected: false });
-  }
-  return d;
+function makeSide() {
+  const deck = [];
+  for (let i = 0; i < 20; i++) deck.push({ id: nextId++ });
+  return { deck, hand: [], field: new Array(SLOTS).fill(null) };
 }
 
-function deal(n = 3) {
-  hand  = freshDeck().slice(0, n);
-  hover = -1;
-  draw();
-}
+const sides = { top: makeSide(), bottom: makeSide() };
+
+// what the player has picked up: { side, from: 'hand'|'field', index }
+let sel   = null;
+let hover = null;
 
 // --- layout -----------------------------------------------------------------
 
-function cardPos(i) {
-  const total = hand.length * CARD_W + (hand.length - 1) * GAP;
-  const x = (cv.width - total) / 2 + i * (CARD_W + GAP);
-  let   y = (cv.height - CARD_H) / 2;
-  if (hand[i].selected) y -= 24;
-  else if (i === hover)  y -= 12;
+function handStep(n) {
+  if (n <= 1) return 0;
+  return Math.min(CARD_W + GAP, (HAND_MAX_W - CARD_W) / (n - 1));
+}
+
+// cards lift toward the middle of the table, so both hands read the same way
+function liftDir(side) { return side === 'top' ? 1 : -1; }
+
+function handPos(side, i) {
+  const n    = sides[side].hand.length;
+  const step = handStep(n);
+  const x    = (cv.width - (CARD_W + step * (n - 1))) / 2 + i * step;
+  let   y    = ROW_Y[side].hand;
+
+  if (sel && sel.side === side && sel.from === 'hand' && sel.index === i)
+    y += liftDir(side) * 24;
+  else if (hover && hover.kind === 'hand' && hover.side === side && hover.index === i)
+    y += liftDir(side) * 12;
+
   return { x, y };
 }
 
-function hitTest(mx, my) {
-  // backwards, so the topmost card wins any overlap
-  for (let i = hand.length - 1; i >= 0; i--) {
-    const { x, y } = cardPos(i);
-    if (mx >= x && mx < x + CARD_W && my >= y && my < y + CARD_H) return i;
-  }
-  return -1;
+function slotPos(side, index) {
+  return {
+    x: FIELD_X + (index % COLS) * (CARD_W + GAP),
+    y: ROW_Y[side][isFront(index) ? 'front' : 'back'],
+  };
 }
 
-function mouse(e) {
-  const r = cv.getBoundingClientRect();
-  return [
-    (e.clientX - r.left) * (cv.width  / r.width),
-    (e.clientY - r.top)  * (cv.height / r.height),
-  ];
+// decks sit outboard, on each side's back row
+function deckPos(side) { return { x: DECK_X, y: ROW_Y[side].back }; }
+
+function handBand(side) {
+  return { y: ROW_Y[side].hand + Math.min(0, liftDir(side) * 24), h: CARD_H + 24 };
+}
+
+// --- hit testing ------------------------------------------------------------
+
+function inRect(mx, my, x, y, w = CARD_W, h = CARD_H) {
+  return mx >= x && mx < x + w && my >= y && my < y + h;
+}
+
+function hitTest(mx, my) {
+  for (const side of SIDES) {
+    // backwards, so the topmost card wins any overlap in a fanned hand
+    const hand = sides[side].hand;
+    for (let i = hand.length - 1; i >= 0; i--) {
+      const { x, y } = handPos(side, i);
+      if (inRect(mx, my, x, y)) return { kind: 'hand', side, index: i };
+    }
+
+    for (let i = 0; i < SLOTS; i++) {
+      const { x, y } = slotPos(side, i);
+      if (inRect(mx, my, x, y)) return { kind: 'field', side, index: i };
+    }
+
+    const d = deckPos(side);
+    if (sides[side].deck.length && inRect(mx, my, d.x, d.y))
+      return { kind: 'deck', side };
+
+    // empty space in the hand row — lets a field card be pulled back to hand
+    const band = handBand(side);
+    if (inRect(mx, my, 0, band.y, cv.width, band.h))
+      return { kind: 'handzone', side };
+  }
+  return null;
+}
+
+// --- actions ----------------------------------------------------------------
+
+function drawFromDeck(side) {
+  const s = sides[side];
+  if (s.deck.length) s.hand.push(s.deck.pop());
+}
+
+// An occupied destination swaps rather than overwrites, so a card is never
+// destroyed by a misclick.
+function placeOnField(dest) {
+  const s = sides[sel.side];
+
+  if (sel.from === 'hand') {
+    const card     = s.hand[sel.index];
+    const occupant = s.field[dest];
+    s.field[dest] = card;
+    if (occupant) s.hand[sel.index] = occupant;
+    else          s.hand.splice(sel.index, 1);
+  } else {
+    const card = s.field[sel.index];
+    s.field[sel.index] = s.field[dest];
+    s.field[dest] = card;
+  }
+}
+
+function returnToHand(at) {
+  const s = sides[sel.side];
+  const card = s.field[sel.index];
+  if (!card) return;
+  s.field[sel.index] = null;
+  s.hand.splice(at === undefined ? s.hand.length : at, 0, card);
 }
 
 // --- drawing ----------------------------------------------------------------
@@ -84,10 +173,7 @@ function roundRect(x, y, w, h, r) {
   ctx.closePath();
 }
 
-function drawCard(i) {
-  const card = hand[i];
-  const { x, y } = cardPos(i);
-
+function drawCard(card, x, y, selected) {
   ctx.save();
   ctx.shadowColor   = 'rgba(0,0,0,0.45)';
   ctx.shadowBlur    = 14;
@@ -97,35 +183,171 @@ function drawCard(i) {
   ctx.fill();
   ctx.restore();
 
-  ctx.strokeStyle = card.selected ? '#e0b64a' : '#cdc9c0';
-  ctx.lineWidth   = card.selected ? 3 : 1.5;
+  ctx.strokeStyle = selected ? '#e0b64a' : '#cdc9c0';
+  ctx.lineWidth   = selected ? 3 : 1.5;
   roundRect(x, y, CARD_W, CARD_H, 9);
   ctx.stroke();
 
+  ctx.fillStyle    = '#1e232a';
+  ctx.textAlign    = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font         = 'bold 15px system-ui, sans-serif';
+  ctx.fillText(card.id, x + 10, y + 9);
+
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font         = '34px system-ui, sans-serif';
+  ctx.fillText(card.id, x + CARD_W / 2, y + CARD_H / 2 + 2);
+}
+
+function drawSlot(side, index) {
+  const { x, y } = slotPos(side, index);
+  const isTarget = sel && sel.side === side;
+  const isHover  = hover && hover.kind === 'field' &&
+                   hover.side === side && hover.index === index;
+
+  let stroke;
+  if (isTarget) {
+    stroke = `rgba(224,182,74,${isHover ? 0.9 : 0.34})`;
+  } else {
+    stroke = `rgba(255,255,255,${isHover ? 0.26 : 0.12})`;
+  }
+
+  ctx.save();
+  ctx.setLineDash([5, 5]);
+  ctx.lineWidth   = 1.5;
+  ctx.strokeStyle = stroke;
+  roundRect(x, y, CARD_W, CARD_H, 9);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDeck(side) {
+  const { x, y } = deckPos(side);
+  const n = sides[side].deck.length;
+
+  if (!n) {
+    ctx.save();
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth   = 1.5;
+    roundRect(x, y, CARD_W, CARD_H, 9);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  // a few offset backs, so the stack reads as depth
+  for (let i = Math.min(3, n - 1); i >= 0; i--) {
+    const lit = i === 0 && hover && hover.kind === 'deck' && hover.side === side;
+    ctx.fillStyle   = lit ? '#454d5e' : '#39404e';
+    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+    ctx.lineWidth   = 1.5;
+    roundRect(x - i * 2, y - i * 2, CARD_W, CARD_H, 9);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  ctx.fillStyle    = '#c3cad6';
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font         = 'bold 22px system-ui, sans-serif';
+  ctx.fillText(n, x + CARD_W / 2, y + CARD_H / 2);
 }
 
 function draw() {
   ctx.fillStyle = '#2a2f3a';
   ctx.fillRect(0, 0, cv.width, cv.height);
 
-  for (let i = 0; i < hand.length; i++) drawCard(i);
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth   = 1;
+  ctx.beginPath();
+  ctx.moveTo(40, cv.height / 2);
+  ctx.lineTo(cv.width - 40, cv.height / 2);
+  ctx.stroke();
+
+  for (const side of SIDES) {
+    for (let i = 0; i < SLOTS; i++) {
+      const card = sides[side].field[i];
+      if (!card) { drawSlot(side, i); continue; }
+      const { x, y } = slotPos(side, i);
+      drawCard(card, x, y,
+        sel && sel.side === side && sel.from === 'field' && sel.index === i);
+    }
+
+    drawDeck(side);
+
+    const hand = sides[side].hand;
+    for (let i = 0; i < hand.length; i++) {
+      const { x, y } = handPos(side, i);
+      drawCard(hand[i], x, y,
+        sel && sel.side === side && sel.from === 'hand' && sel.index === i);
+    }
+  }
 }
 
 // --- input ------------------------------------------------------------------
 
+function mouse(e) {
+  const r = cv.getBoundingClientRect();
+  return [
+    (e.clientX - r.left) * (cv.width  / r.width),
+    (e.clientY - r.top)  * (cv.height / r.height),
+  ];
+}
+
+function sameSpot(s, h) {
+  return s && h && s.side === h.side && s.from === h.kind && s.index === h.index;
+}
+
 cv.addEventListener('mousemove', e => {
   const h = hitTest(...mouse(e));
-  if (h !== hover) { hover = h; draw(); }
+  const changed = (h && h.kind)  !== (hover && hover.kind)  ||
+                  (h && h.side)  !== (hover && hover.side)  ||
+                  (h && h.index) !== (hover && hover.index);
+  if (changed) { hover = h; draw(); }
 });
 
-cv.addEventListener('mouseleave', () => { hover = -1; draw(); });
+cv.addEventListener('mouseleave', () => { hover = null; draw(); });
 
 cv.addEventListener('click', e => {
-  const i = hitTest(...mouse(e));
-  if (i >= 0) { hand[i].selected = !hand[i].selected; draw(); }
+  const hit = hitTest(...mouse(e));
+
+  if (!hit) { sel = null; draw(); return; }
+
+  if (hit.kind === 'deck') { drawFromDeck(hit.side); draw(); return; }
+
+  if (!sel) {
+    if (hit.kind === 'hand')
+      sel = { side: hit.side, from: 'hand', index: hit.index };
+    else if (hit.kind === 'field' && sides[hit.side].field[hit.index])
+      sel = { side: hit.side, from: 'field', index: hit.index };
+    draw();
+    return;
+  }
+
+  // Something is held. Moves stay on one side; touching the other side just
+  // re-selects rather than reaching across the table.
+  if (hit.kind === 'field') {
+    if (hit.side === sel.side) { placeOnField(hit.index); sel = null; }
+    else if (sides[hit.side].field[hit.index])
+      sel = { side: hit.side, from: 'field', index: hit.index };
+    else sel = null;
+  } else if (hit.kind === 'hand') {
+    if (sameSpot(sel, hit)) sel = null;
+    else if (hit.side === sel.side && sel.from === 'field') {
+      returnToHand(hit.index); sel = null;
+    } else sel = { side: hit.side, from: 'hand', index: hit.index };
+  } else if (hit.kind === 'handzone') {
+    if (hit.side === sel.side && sel.from === 'field') returnToHand();
+    sel = null;
+  }
+
+  draw();
 });
 
-deal();
+for (const side of SIDES) for (let i = 0; i < 5; i++) drawFromDeck(side);
+draw();
 </script>
 </body>
 </html>

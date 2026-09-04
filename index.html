@@ -6,26 +6,18 @@
   body {
     margin: 0; height: 100vh;
     display: grid; place-content: center; gap: 14px;
-    background: #14181c; color: #aeb6bd;
+    background: #12141a; color: #8f97a3;
     font: 14px system-ui, sans-serif;
   }
-  canvas { border-radius: 8px; cursor: pointer; }
-  #bar { display: flex; gap: 10px; align-items: center; }
-  button {
-    font: inherit; padding: 6px 12px;
-    border: 1px solid #39424a; border-radius: 6px;
-    background: #21272d; color: #dfe4e8; cursor: pointer;
+  canvas {
+    border-radius: 10px; cursor: pointer;
+    box-shadow: 0 18px 50px rgba(0,0,0,0.55);
   }
-  button:hover { background: #2b333a; }
 </style>
 </head>
 <body>
 
 <canvas id="c" width="1024" height="768"></canvas>
-<div id="bar">
-  <button id="deal">Deal</button>
-  <span id="status"></span>
-</div>
 
 <script>
 const cv  = document.getElementById('c');
@@ -113,7 +105,7 @@ function drawCard(i) {
 }
 
 function draw() {
-  ctx.fillStyle = '#1d5c3d';
+  ctx.fillStyle = '#22343b';
   ctx.fillRect(0, 0, cv.width, cv.height);
 
   for (let i = 0; i < hand.length; i++) drawCard(i);
@@ -136,8 +128,6 @@ cv.addEventListener('click', e => {
   const i = hitTest(...mouse(e));
   if (i >= 0) { hand[i].selected = !hand[i].selected; draw(); }
 });
-
-document.getElementById('deal').addEventListener('click', () => deal());
 
 deal();
 </script>

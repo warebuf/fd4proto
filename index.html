@@ -2,7 +2,6 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>card proto</title>
 <style>
   body {
     margin: 0; height: 100vh;
@@ -32,15 +31,7 @@
 const cv  = document.getElementById('c');
 const ctx = cv.getContext('2d');
 
-const CARD_W = 100, CARD_H = 148, GAP = 18;
-
-const SUITS = [
-  { sym: '♣', red: false },  // clubs
-  { sym: '♦', red: true  },  // diamonds
-  { sym: '♥', red: true  },  // hearts
-  { sym: '♠', red: false },  // spades
-];
-const RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+const CARD_W = 100, CARD_H = 100, GAP = 15;
 
 // --- state ------------------------------------------------------------------
 
@@ -49,22 +40,14 @@ let hover = -1;
 
 function freshDeck() {
   const d = [];
-  for (let s = 0; s < SUITS.length; s++)
-    for (let r = 0; r < RANKS.length; r++)
-      d.push({ rank: r, suit: s, selected: false });
-  return d;
-}
-
-function shuffle(d) {
-  for (let i = d.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [d[i], d[j]] = [d[j], d[i]];
+  for (let i = 0; i < 10; i++) {
+    d.push({ selected: false });
   }
   return d;
 }
 
-function deal(n = 5) {
-  hand  = shuffle(freshDeck()).slice(0, n);
+function deal(n = 3) {
+  hand  = freshDeck().slice(0, n);
   hover = -1;
   draw();
 }
@@ -112,8 +95,6 @@ function roundRect(x, y, w, h, r) {
 function drawCard(i) {
   const card = hand[i];
   const { x, y } = cardPos(i);
-  const suit = SUITS[card.suit];
-  const ink  = suit.red ? '#c8322f' : '#1e232a';
 
   ctx.save();
   ctx.shadowColor   = 'rgba(0,0,0,0.45)';
@@ -129,32 +110,6 @@ function drawCard(i) {
   roundRect(x, y, CARD_W, CARD_H, 9);
   ctx.stroke();
 
-  const label = RANKS[card.rank];
-  ctx.fillStyle = ink;
-
-  // top-left corner
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.font = 'bold 20px system-ui, sans-serif';
-  ctx.fillText(label, x + 9, y + 8);
-  ctx.font = '18px system-ui, sans-serif';
-  ctx.fillText(suit.sym, x + 9, y + 30);
-
-  // center pip
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font = '46px system-ui, sans-serif';
-  ctx.fillText(suit.sym, x + CARD_W / 2, y + CARD_H / 2 + 4);
-
-  // bottom-right corner, rotated
-  ctx.save();
-  ctx.translate(x + CARD_W - 9, y + CARD_H - 8);
-  ctx.rotate(Math.PI);
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.font = 'bold 20px system-ui, sans-serif';
-  ctx.fillText(label, 0, 0);
-  ctx.restore();
 }
 
 function draw() {

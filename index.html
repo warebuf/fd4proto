@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>card proto</title>
+<style>
+  body {
+    margin: 0; height: 100vh;
+    display: grid; place-content: center; gap: 14px;
+    background: #14181c; color: #aeb6bd;
+    font: 14px system-ui, sans-serif;
+  }
+  canvas { border-radius: 8px; cursor: pointer; }
+  #bar { display: flex; gap: 10px; align-items: center; }
+  button {
+    font: inherit; padding: 6px 12px;
+    border: 1px solid #39424a; border-radius: 6px;
+    background: #21272d; color: #dfe4e8; cursor: pointer;
+  }
+  button:hover { background: #2b333a; }
+</style>
+</head>
+<body>
+
+<canvas id="c" width="900" height="520"></canvas>
+<div id="bar">
+  <button id="deal">Deal</button>
+  <span id="status"></span>
+</div>
+
+<script>
+const cv  = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+const CARD_W = 100, CARD_H = 148, GAP = 18;
+
+const SUITS = [
+  { sym: '♣', red: false },  // clubs
+  { sym: '♦', red: true  },  // diamonds
+  { sym: '♥', red: true  },  // hearts
+  { sym: '♠', red: false },  // spades
+];
+const RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+
+// --- state ------------------------------------------------------------------
+
+let hand  = [];
+let hover = -1;
+
+function freshDeck() {
+  const d = [];
+  for (let s = 0; s < SUITS.length; s++)
+    for (let r = 0; r < RANKS.length; r++)
+      d.push({ rank: r, suit: s, selected: false });
+  return d;
+}
+
+function shuffle(d) {
+  for (let i = d.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [d[i], d[j]] = [d[j], d[i]];
+  }
+  return d;
+}
+
+function deal(n = 5) {
+  hand  = shuffle(freshDeck()).slice(0, n);
+  hover = -1;
+  draw();
+}
+
+// --- layout -----------------------------------------------------------------
+
+function cardPos(i) {
+  const total = hand.length * CARD_W + (hand.length - 1) * GAP;
+  const x = (cv.width - total) / 2 + i * (CARD_W + GAP);
+  let   y = (cv.height - CARD_H) / 2;
+  if (hand[i].selected) y -= 24;
+  else if (i === hover)  y -= 12;
+  return { x, y };
+}
+
+function hitTest(mx, my) {
+  // backwards, so the topmost card wins any overlap
+  for (let i = hand.length - 1; i >= 0; i--) {
+    const { x, y } = cardPos(i);
+    if (mx >= x && mx < x + CARD_W && my >= y && my < y + CARD_H) return i;
+  }
+  return -1;
+}
+
+function mouse(e) {
+  const r = cv.getBoundingClientRect();
+  return [
+    (e.clientX - r.left) * (cv.width  / r.width),
+    (e.clientY - r.top)  * (cv.height / r.height),
+  ];
+}
+
+// --- drawing ----------------------------------------------------------------
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x,     y + h, r);
+  ctx.arcTo(x,     y + h, x,     y,     r);
+  ctx.arcTo(x,     y,     x + w, y,     r);
+  ctx.closePath();
+}
+
+function drawCard(i) {
+  const card = hand[i];
+  const { x, y } = cardPos(i);
+  const suit = SUITS[card.suit];
+  const ink  = suit.red ? '#c8322f' : '#1e232a';
+
+  ctx.save();
+  ctx.shadowColor   = 'rgba(0,0,0,0.45)';
+  ctx.shadowBlur    = 14;
+  ctx.shadowOffsetY = 5;
+  ctx.fillStyle     = '#f7f6f2';
+  roundRect(x, y, CARD_W, CARD_H, 9);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = card.selected ? '#e0b64a' : '#cdc9c0';
+  ctx.lineWidth   = card.selected ? 3 : 1.5;
+  roundRect(x, y, CARD_W, CARD_H, 9);
+  ctx.stroke();
+
+  const label = RANKS[card.rank];
+  ctx.fillStyle = ink;
+
+  // top-left corner
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold 20px system-ui, sans-serif';
+  ctx.fillText(label, x + 9, y + 8);
+  ctx.font = '18px system-ui, sans-serif';
+  ctx.fillText(suit.sym, x + 9, y + 30);
+
+  // center pip
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = '46px system-ui, sans-serif';
+  ctx.fillText(suit.sym, x + CARD_W / 2, y + CARD_H / 2 + 4);
+
+  // bottom-right corner, rotated
+  ctx.save();
+  ctx.translate(x + CARD_W - 9, y + CARD_H - 8);
+  ctx.rotate(Math.PI);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold 20px system-ui, sans-serif';
+  ctx.fillText(label, 0, 0);
+  ctx.restore();
+}
+
+function draw() {
+  ctx.fillStyle = '#1d5c3d';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+
+  for (let i = 0; i < hand.length; i++) drawCard(i);
+
+  const n = hand.filter(c => c.selected).length;
+  document.getElementById('status').textContent =
+    n ? `${n} selected` : 'click a card to select';
+}
+
+// --- input ------------------------------------------------------------------
+
+cv.addEventListener('mousemove', e => {
+  const h = hitTest(...mouse(e));
+  if (h !== hover) { hover = h; draw(); }
+});
+
+cv.addEventListener('mouseleave', () => { hover = -1; draw(); });
+
+cv.addEventListener('click', e => {
+  const i = hitTest(...mouse(e));
+  if (i >= 0) { hand[i].selected = !hand[i].selected; draw(); }
+});
+
+document.getElementById('deal').addEventListener('click', () => deal());
+
+deal();
+</script>
+</body>
+</html>

@@ -241,6 +241,12 @@ const TICK_MS = 55;
 
 function other(side) { return side === 'top' ? 'bottom' : 'top'; }
 
+// abilities are NOT simultaneous. they resolve one at a time by card position,
+// down each column before moving right: left front, left back, second front,
+// second back. attacks and deaths are simultaneous, abilities cannot be
+const RESOLUTION_ORDER = [];
+for (let col = 0; col < COLS; col++) RESOLUTION_ORDER.push(col, col + COLS);
+
 // SPD is how fast, not how slow: 5 SPD swings every tick, 1 SPD every 5.
 function attackInterval(card) { return STAT_MAX + 1 - card.spd; }
 
@@ -284,8 +290,8 @@ function kill(side, index) {
 // queue order, so it stays a tiebreak rather than an advantage.
 function tick() {
   const swinging = [];
-  for (const side of SIDES)
-    for (let i = 0; i < SLOTS; i++) {
+  for (const i of RESOLUTION_ORDER)
+    for (const side of SIDES) {
       const card = sides[side].field[i];
       if (!card) continue;
       if (--card.cd <= 0) { card.cd = attackInterval(card); swinging.push([side, i]); }
@@ -306,8 +312,8 @@ function tick() {
   }
 
   const dead = [];
-  for (const side of SIDES)
-    for (let i = 0; i < SLOTS; i++) {
+  for (const i of RESOLUTION_ORDER)
+    for (const side of SIDES) {
       const card = sides[side].field[i];
       if (card && card.hp <= 0) { dead.push(card); kill(side, i); }
     }

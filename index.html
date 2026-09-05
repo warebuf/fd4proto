@@ -239,7 +239,7 @@ function sendToGrave() {
 // --- combat -----------------------------------------------------------------
 
 const TICKS = 3;
-const TICK_MS = 1000;   // one animated tick
+const TICK_MS = 2000;   // one animated tick
 
 let simTicks  = 0;
 let tickStart = 0;
@@ -358,13 +358,15 @@ function roundRect(x, y, w, h, r) {
   ctx.closePath();
 }
 
-// ATK / SPD / HP across the foot of the card, colour-coded so the three read
-// apart at a glance without needing the labels
+// ATK / SPD / HP / DPS across the foot of the card, colour-coded so they read
+// apart at a glance without needing the labels. DPS is derived (average damage
+// per tick), so it's a function of the card rather than a stored key.
 const STAT_STRIP = 40;
 const STATS = [
-  ['ATK', 'atk', '#b4463c'],
-  ['SPD', 'spd', '#4a7fb5'],
-  ['HP',  'hp',  '#3f8a5c'],
+  ['ATK', c => c.atk, '#b4463c'],
+  ['SPD', c => c.spd, '#4a7fb5'],
+  ['HP',  c => c.hp,  '#3f8a5c'],
+  ['DPS', c => (c.atk / attackInterval(c)).toFixed(1), '#c98a3c'],
 ];
 
 function drawStats(card, x, y) {
@@ -378,7 +380,7 @@ function drawStats(card, x, y) {
   ctx.stroke();
 
   ctx.textAlign = 'center';
-  STATS.forEach(([label, key, colour], i) => {
+  STATS.forEach(([label, value, colour], i) => {
     const cx = x + CARD_W * (i * 2 + 1) / (STATS.length * 2);
 
     ctx.textBaseline = 'top';
@@ -388,8 +390,8 @@ function drawStats(card, x, y) {
 
     ctx.textBaseline = 'middle';
     ctx.fillStyle    = colour;
-    ctx.font         = 'bold 21px system-ui, sans-serif';
-    ctx.fillText(card[key], cx, top + 27);
+    ctx.font         = 'bold 15px system-ui, sans-serif';
+    ctx.fillText(value(card), cx, top + 27);
   });
 }
 

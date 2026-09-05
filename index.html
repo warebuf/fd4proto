@@ -13,18 +13,31 @@
     border-radius: 10px; cursor: pointer;
     box-shadow: 0 18px 50px rgba(0,0,0,0.55);
   }
+  #bar { display: flex; gap: 12px; align-items: center; }
+  button {
+    font: inherit; padding: 6px 14px;
+    border: 1px solid #39424a; border-radius: 6px;
+    background: #21272d; color: #dfe4e8; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #2b333a; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  #status { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
 
 <canvas id="c" width="1024" height="768"></canvas>
+<div id="bar">
+  <button id="sim">Simulate 100 ticks</button>
+  <span id="status"></span>
+</div>
 
 <script>
 const cv  = document.getElementById('c');
 const ctx = cv.getContext('2d');
 
 const CARD_W = 100, CARD_H = 100, GAP = 15;
-const COLS = 3, SLOTS = 6;
+const COLS = 5, ROWS = 2, SLOTS = COLS * ROWS;
 const HAND_MAX_W = 900;   // hands fan inward past this, rather than overflowing
 const SIDES = ['top', 'bottom'];
 
@@ -41,22 +54,33 @@ const ROW_Y = {
 
 const FIELD_X = (cv.width - (COLS * CARD_W + (COLS - 1) * GAP)) / 2;
 const DECK_X  = FIELD_X + COLS * (CARD_W + GAP) + 40;
+const GRAVE_X = cv.width - DECK_X - CARD_W;   // mirrors the deck across the board
 
 // --- state ------------------------------------------------------------------
 
 let nextId = 1;
 
+const STAT_MIN = 1, STAT_MAX = 5;
+const roll = () => STAT_MIN + Math.floor(Math.random() * (STAT_MAX - STAT_MIN + 1));
+
+function makeCard() {
+  return { id: nextId++, crowned: false, atk: roll(), spd: roll(), hp: roll(), cd: 0 };
+}
+
 function makeSide() {
   const deck = [];
-  for (let i = 0; i < 20; i++) deck.push({ id: nextId++ });
-  return { deck, hand: [], field: new Array(SLOTS).fill(null) };
+  for (let i = 0; i < 20; i++) deck.push(makeCard());
+  return { deck, hand: [], grave: [], field: new Array(SLOTS).fill(null) };
 }
 
 const sides = { top: makeSide(), bottom: makeSide() };
 
-// what the player has picked up: { side, from: 'hand'|'field', index }
+// what the player has picked up: { side, from: 'hand'|'field'|'grave', index }
 let sel   = null;
 let hover = null;
+
+// the board is read-only while a simulation is running
+let simulating = false;
 
 // --- layout -----------------------------------------------------------------
 
@@ -89,8 +113,9 @@ function slotPos(side, index) {
   };
 }
 
-// decks sit outboard, on each side's back row
-function deckPos(side) { return { x: DECK_X, y: ROW_Y[side].back }; }
+// deck and graveyard sit outboard on each side's back row, deck right, grave left
+function deckPos(side)  { return { x: DECK_X,  y: ROW_Y[side].back }; }
+function gravePos(side) { return { x: GRAVE_X, y: ROW_Y[side].back }; }
 
 function handBand(side) {
   return { y: ROW_Y[side].hand + Math.min(0, liftDir(side) * 24), h: CARD_H + 24 };
@@ -120,6 +145,9 @@ function hitTest(mx, my) {
     if (sides[side].deck.length && inRect(mx, my, d.x, d.y))
       return { kind: 'deck', side };
 
+    const gy = gravePos(side);
+    if (inRect(mx, my, gy.x, gy.y)) return { kind: 'grave', side };
+
     // empty space in the hand row — lets a field card be pulled back to hand
     const band = handBand(side);
     if (inRect(mx, my, 0, band.y, cv.width, band.h))
@@ -135,30 +163,166 @@ function drawFromDeck(side) {
   if (s.deck.length) s.hand.push(s.deck.pop());
 }
 
+// The crown is a field status and a side may hold only one, so crowning a
+// second unit moves it rather than being refused. Leaving the field drops it.
+function crownedIndex(side) {
+  return sides[side].field.findIndex(c => c && c.crowned);
+}
+
+function toggleCrown(side, index) {
+  const card = sides[side].field[index];
+  if (!card) return;
+  const wasCrowned = card.crowned;
+  for (const c of sides[side].field) if (c) c.crowned = false;
+  card.crowned = !wasCrowned;
+}
+
+// hand and graveyard are both plain lists, so they behave alike as a source
+function zoneList(side, from) {
+  return from === 'hand' ? sides[side].hand : sides[side].grave;
+}
+
 // An occupied destination swaps rather than overwrites, so a card is never
 // destroyed by a misclick.
 function placeOnField(dest) {
   const s = sides[sel.side];
 
-  if (sel.from === 'hand') {
-    const card     = s.hand[sel.index];
-    const occupant = s.field[dest];
-    s.field[dest] = card;
-    if (occupant) s.hand[sel.index] = occupant;
-    else          s.hand.splice(sel.index, 1);
-  } else {
+  if (sel.from === 'field') {
     const card = s.field[sel.index];
     s.field[sel.index] = s.field[dest];
     s.field[dest] = card;
+    return;
   }
+
+  const list     = zoneList(sel.side, sel.from);
+  const card     = list[sel.index];
+  const occupant = s.field[dest];
+  s.field[dest] = card;
+  if (occupant) { occupant.crowned = false; list[sel.index] = occupant; }
+  else          list.splice(sel.index, 1);
+}
+
+// Lift the held card out of wherever it is. The crown is a field status, so it
+// never survives the trip.
+function liftSelected() {
+  const s = sides[sel.side];
+  let card;
+
+  if (sel.from === 'field') {
+    card = s.field[sel.index];
+    if (!card) return null;
+    s.field[sel.index] = null;
+  } else {
+    card = zoneList(sel.side, sel.from).splice(sel.index, 1)[0];
+    if (!card) return null;
+  }
+
+  card.crowned = false;
+  card.cd = 0;
+  return card;
 }
 
 function returnToHand(at) {
-  const s = sides[sel.side];
-  const card = s.field[sel.index];
+  const card = liftSelected();
   if (!card) return;
-  s.field[sel.index] = null;
-  s.hand.splice(at === undefined ? s.hand.length : at, 0, card);
+  const hand = sides[sel.side].hand;
+  hand.splice(at === undefined ? hand.length : at, 0, card);
+}
+
+function sendToGrave() {
+  const card = liftSelected();
+  if (card) sides[sel.side].grave.push(card);
+}
+
+// --- combat -----------------------------------------------------------------
+
+const TICKS = 100;
+const TICK_MS = 55;
+
+function other(side) { return side === 'top' ? 'bottom' : 'top'; }
+
+// SPD is how fast, not how slow: 5 SPD swings every tick, 1 SPD every 5.
+function attackInterval(card) { return STAT_MAX + 1 - card.spd; }
+
+// TARGETING — the one rule to change if you want different behaviour. Uniformly
+// random across every living enemy; position buys nothing.
+function targetFor(side) {
+  const foe = sides[other(side)].field;
+  const live = [];
+  for (let i = 0; i < SLOTS; i++) if (foe[i]) live.push(i);
+  if (!live.length) return -1;
+  return live[Math.floor(Math.random() * live.length)];
+}
+
+// The corpse keeps the damage that killed it, so the board stays readable after
+// a run. The crown does not follow it — that is field state, and letting it into
+// the graveyard would let a revived unit make two crowns on one side.
+function kill(side, index) {
+  const s = sides[side];
+  const card = s.field[index];
+  card.crowned = false;
+  s.grave.push(card);
+  s.field[index] = null;
+}
+
+// A tick runs in phases:
+//
+//   1. cooldowns — who is ready to swing
+//   2. declare   — each swinger locks a target against the board as it stands
+//   3. damage    — every blow lands at once, so neither side resolves "first"
+//   4. cleanup   — anything at or below 0 hp dies
+//
+// Damage is simultaneous because no sequential order can be fair: whoever swings
+// first removes their own retaliator. In mirror matches, resolving all of one
+// side first won 84% of games, and interleaving by slot still won 68%.
+//
+// TRIGGERS, when they arrive, do NOT go in phase 3. They belong in a queue
+// drained after it — and again after phase 4 for death triggers — resolving one
+// event at a time in the order queued. That is what keeps them legible: an
+// effect always reads a settled board, never one that is half updated. Phase 1's
+// row-major walk (frontline left to right, then backline) is what decides that
+// queue order, so it stays a tiebreak rather than an advantage.
+function tick() {
+  const swinging = [];
+  for (const side of SIDES)
+    for (let i = 0; i < SLOTS; i++) {
+      const card = sides[side].field[i];
+      if (!card) continue;
+      if (--card.cd <= 0) { card.cd = attackInterval(card); swinging.push([side, i]); }
+    }
+
+  const blows = [];
+  for (const [side, i] of swinging) {
+    const attacker = sides[side].field[i];
+    const t = targetFor(side);
+    if (t < 0) continue;
+    blows.push({ side: other(side), slot: t, dmg: attacker.atk });
+  }
+
+  // nothing is removed until phase 4, so two blows on one unit both land
+  for (const b of blows) {
+    const victim = sides[b.side].field[b.slot];
+    if (victim) victim.hp -= b.dmg;
+  }
+
+  const dead = [];
+  for (const side of SIDES)
+    for (let i = 0; i < SLOTS; i++) {
+      const card = sides[side].field[i];
+      if (card && card.hp <= 0) { dead.push(card); kill(side, i); }
+    }
+
+  return { blows: blows.length, dead: dead.length };
+}
+
+function fieldCount(side) { return sides[side].field.filter(Boolean).length; }
+
+function outcome() {
+  const t = fieldCount('top'), b = fieldCount('bottom');
+  if (!t && !b) return 'both sides wiped';
+  if (!t) return 'bottom wins';
+  if (!b) return 'top wins';
+  return null;
 }
 
 // --- drawing ----------------------------------------------------------------
@@ -171,6 +335,68 @@ function roundRect(x, y, w, h, r) {
   ctx.arcTo(x,     y + h, x,     y,     r);
   ctx.arcTo(x,     y,     x + w, y,     r);
   ctx.closePath();
+}
+
+// ATK / SPD / HP across the foot of the card, colour-coded so the three read
+// apart at a glance without needing the labels
+const STAT_STRIP = 40;
+const STATS = [
+  ['ATK', 'atk', '#b4463c'],
+  ['SPD', 'spd', '#4a7fb5'],
+  ['HP',  'hp',  '#3f8a5c'],
+];
+
+function drawStats(card, x, y) {
+  const top = y + CARD_H - STAT_STRIP;
+
+  ctx.strokeStyle = 'rgba(30,35,42,0.16)';
+  ctx.lineWidth   = 1;
+  ctx.beginPath();
+  ctx.moveTo(x + 9,          top);
+  ctx.lineTo(x + CARD_W - 9, top);
+  ctx.stroke();
+
+  ctx.textAlign = 'center';
+  STATS.forEach(([label, key, colour], i) => {
+    const cx = x + CARD_W * (i * 2 + 1) / (STATS.length * 2);
+
+    ctx.textBaseline = 'top';
+    ctx.fillStyle    = '#8b8880';
+    ctx.font         = '9px system-ui, sans-serif';
+    ctx.fillText(label, cx, top + 6);
+
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle    = colour;
+    ctx.font         = 'bold 21px system-ui, sans-serif';
+    ctx.fillText(card[key], cx, top + 27);
+  });
+}
+
+// three-peaked crown on a banded base, drawn in a 26x17 box
+function drawCrown(x, y) {
+  const w = 26, h = 17, band = 5;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x,           y + h - band);
+  ctx.lineTo(x,           y + 2);
+  ctx.lineTo(x + w * 0.27, y + h - band - 3);
+  ctx.lineTo(x + w / 2,   y);
+  ctx.lineTo(x + w * 0.73, y + h - band - 3);
+  ctx.lineTo(x + w,       y + 2);
+  ctx.lineTo(x + w,       y + h - band);
+  ctx.closePath();
+  ctx.fillStyle = '#e8c15c';
+  ctx.fill();
+  ctx.strokeStyle = '#8a6a1c';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.rect(x - 1, y + h - band, w + 2, band);
+  ctx.fillStyle = '#d9ae43';
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
 }
 
 function drawCard(card, x, y, selected) {
@@ -191,13 +417,12 @@ function drawCard(card, x, y, selected) {
   ctx.fillStyle    = '#1e232a';
   ctx.textAlign    = 'left';
   ctx.textBaseline = 'top';
-  ctx.font         = 'bold 15px system-ui, sans-serif';
+  ctx.font         = 'bold 16px system-ui, sans-serif';
   ctx.fillText(card.id, x + 10, y + 9);
 
-  ctx.textAlign    = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font         = '34px system-ui, sans-serif';
-  ctx.fillText(card.id, x + CARD_W / 2, y + CARD_H / 2 + 2);
+  drawStats(card, x, y);
+
+  if (card.crowned) drawCrown(x + CARD_W - 35, y + 9);
 }
 
 function drawSlot(side, index) {
@@ -255,6 +480,63 @@ function drawDeck(side) {
   ctx.fillText(n, x + CARD_W / 2, y + CARD_H / 2);
 }
 
+function drawEmptyPile(x, y, target) {
+  ctx.save();
+  ctx.setLineDash([5, 5]);
+  ctx.lineWidth   = 1.5;
+  ctx.strokeStyle = target ? 'rgba(224,182,74,0.34)' : 'rgba(255,255,255,0.10)';
+  roundRect(x, y, CARD_W, CARD_H, 9);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Face-up, under a wash so the pile reads as spent rather than in play.
+function drawGrave(side) {
+  const { x, y } = gravePos(side);
+  const pile = sides[side].grave;
+  const n    = pile.length;
+  const target = sel && sel.side === side && sel.from !== 'grave';
+  const lit    = hover && hover.kind === 'grave' && hover.side === side;
+
+  if (!n) { drawEmptyPile(x, y, target); return; }
+
+  for (let i = Math.min(2, n - 1); i >= 1; i--) {
+    ctx.fillStyle   = '#4c525f';
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth   = 1;
+    roundRect(x - i * 2, y - i * 2, CARD_W, CARD_H, 9);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  const held = sel && sel.side === side && sel.from === 'grave' && sel.index === n - 1;
+  drawCard(pile[n - 1], x, y, held);
+
+  ctx.save();
+  roundRect(x, y, CARD_W, CARD_H, 9);
+  ctx.clip();
+  ctx.fillStyle = `rgba(20,24,30,${held ? 0.14 : lit ? 0.24 : 0.42})`;
+  ctx.fillRect(x, y, CARD_W, CARD_H);
+  ctx.restore();
+
+  if (target) {
+    ctx.strokeStyle = 'rgba(224,182,74,0.85)';
+    ctx.lineWidth   = 3;
+    roundRect(x, y, CARD_W, CARD_H, 9);
+    ctx.stroke();
+  }
+
+  const bw = 26, bh = 18, bx = x + CARD_W - bw - 7, by = y + 7;
+  ctx.fillStyle = 'rgba(16,18,24,0.86)';
+  roundRect(bx, by, bw, bh, 5);
+  ctx.fill();
+  ctx.fillStyle    = '#c3cad6';
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font         = 'bold 12px system-ui, sans-serif';
+  ctx.fillText(n, bx + bw / 2, by + bh / 2 + 1);
+}
+
 function draw() {
   ctx.fillStyle = '#2a2f3a';
   ctx.fillRect(0, 0, cv.width, cv.height);
@@ -276,6 +558,7 @@ function draw() {
     }
 
     drawDeck(side);
+    drawGrave(side);
 
     const hand = sides[side].hand;
     for (let i = 0; i < hand.length; i++) {
@@ -301,6 +584,7 @@ function sameSpot(s, h) {
 }
 
 cv.addEventListener('mousemove', e => {
+  if (simulating) return;
   const h = hitTest(...mouse(e));
   const changed = (h && h.kind)  !== (hover && hover.kind)  ||
                   (h && h.side)  !== (hover && hover.side)  ||
@@ -310,7 +594,17 @@ cv.addEventListener('mousemove', e => {
 
 cv.addEventListener('mouseleave', () => { hover = null; draw(); });
 
+// right-click a unit on the field to crown it
+cv.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  if (simulating) return;
+  const hit = hitTest(...mouse(e));
+  if (hit && hit.kind === 'field') toggleCrown(hit.side, hit.index);
+  draw();
+});
+
 cv.addEventListener('click', e => {
+  if (simulating) return;
   const hit = hitTest(...mouse(e));
 
   if (!hit) { sel = null; draw(); return; }
@@ -322,6 +616,8 @@ cv.addEventListener('click', e => {
       sel = { side: hit.side, from: 'hand', index: hit.index };
     else if (hit.kind === 'field' && sides[hit.side].field[hit.index])
       sel = { side: hit.side, from: 'field', index: hit.index };
+    else if (hit.kind === 'grave' && sides[hit.side].grave.length)
+      sel = { side: hit.side, from: 'grave', index: sides[hit.side].grave.length - 1 };
     draw();
     return;
   }
@@ -335,16 +631,64 @@ cv.addEventListener('click', e => {
     else sel = null;
   } else if (hit.kind === 'hand') {
     if (sameSpot(sel, hit)) sel = null;
-    else if (hit.side === sel.side && sel.from === 'field') {
+    else if (hit.side === sel.side && sel.from !== 'hand') {
       returnToHand(hit.index); sel = null;
     } else sel = { side: hit.side, from: 'hand', index: hit.index };
+  } else if (hit.kind === 'grave') {
+    if (hit.side === sel.side && sel.from !== 'grave') sendToGrave();
+    sel = null;
   } else if (hit.kind === 'handzone') {
-    if (hit.side === sel.side && sel.from === 'field') returnToHand();
+    if (hit.side === sel.side && sel.from !== 'hand') returnToHand();
     sel = null;
   }
 
   draw();
 });
+
+// --- simulation runner ------------------------------------------------------
+
+const simBtn = document.getElementById('sim');
+const statusEl = document.getElementById('status');
+
+function setStatus(t) { statusEl.textContent = t; }
+
+function startSim() {
+  if (simulating) return;
+  if (!fieldCount('top') || !fieldCount('bottom')) {
+    setStatus('needs units on both sides');
+    return;
+  }
+
+  simulating = true;
+  sel = null;
+  hover = null;
+  simBtn.disabled = true;
+
+  // every unit starts its first swing from a full cooldown
+  for (const side of SIDES)
+    for (const card of sides[side].field) if (card) card.cd = attackInterval(card);
+
+  let n = 0;
+  draw();
+
+  const timer = setInterval(() => {
+    tick();
+    n++;
+    draw();
+
+    const done = outcome();
+    if (n >= TICKS || done) {
+      clearInterval(timer);
+      simulating = false;
+      simBtn.disabled = false;
+      setStatus(done ? `${done} — tick ${n}` : `${TICKS} ticks complete`);
+    } else {
+      setStatus(`tick ${n} / ${TICKS}`);
+    }
+  }, TICK_MS);
+}
+
+simBtn.addEventListener('click', startSim);
 
 for (const side of SIDES) for (let i = 0; i < 5; i++) drawFromDeck(side);
 draw();

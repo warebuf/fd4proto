@@ -13,7 +13,7 @@
     border-radius: 10px; cursor: pointer;
     box-shadow: 0 18px 50px rgba(0,0,0,0.55);
   }
-  #bar { display: flex; gap: 12px; align-items: center; }
+  #bar { width: 1024px; display: flex; gap: 8px; align-items: center; }
   button {
     font: inherit; padding: 6px 14px;
     border: 1px solid #39424a; border-radius: 6px;
@@ -21,7 +21,8 @@
   }
   button:hover:not(:disabled) { background: #2b333a; }
   button:disabled { opacity: 0.45; cursor: default; }
-  #status { font-variant-numeric: tabular-nums; }
+  #status { margin-left: 6px; font-variant-numeric: tabular-nums; }
+  #keys { margin-left: auto; font-size: 12px; color: #5d6472; }
 </style>
 </head>
 <body>
@@ -29,7 +30,10 @@
 <canvas id="c" width="1024" height="768"></canvas>
 <div id="bar">
   <button id="sim"></button>
+  <button id="play"></button>
+  <button id="step"></button>
   <span id="status"></span>
+  <span id="keys">space play/pause &middot; &rarr; step &middot; esc stop</span>
 </div>
 
 <script>
@@ -239,10 +243,6 @@ function sendToGrave() {
 // --- combat -----------------------------------------------------------------
 
 const TICKS = 3;
-const TICK_MS = 2000;   // one animated tick
-
-let simTicks  = 0;
-let tickStart = 0;
 
 function other(side) { return side === 'top' ? 'bottom' : 'top'; }
 
@@ -284,57 +284,136 @@ function kill(side, index) {
   s.field[index] = null;
 }
 
-// A tick runs in phases:
-//
-//   1. cooldowns — who is ready to swing
-//   2. declare   — each swinger locks a target against the board as it stands
-//   3. damage    — every blow lands at once, so neither side resolves "first"
-//   4. cleanup   — anything at or below 0 hp dies
-//
-// Damage is simultaneous because no sequential order can be fair: whoever swings
-// first removes their own retaliator. In mirror matches, resolving all of one
-// side first won 84% of games, and interleaving by slot still won 68%.
-//
-// TRIGGERS, when they arrive, do NOT go in phase 3. They belong in a queue
-// drained after it — and again after phase 4 for death triggers — resolving one
-// event at a time in the order queued. That is what keeps them legible: an
-// effect always reads a settled board, never one that is half updated. Phase 1's
-// row-major walk (frontline left to right, then backline) is what decides that
-// queue order, so it stays a tiebreak rather than an advantage.
-function tick() {
-  const swinging = [];
+// Every occupied slot, both sides interleaved, in resolution order — so no
+// phase has to repeat the double walk.
+function* units() {
   for (let k = 0; k < SLOTS; k++)
     for (const side of SIDES) {
       const i = RESOLUTION_ORDER[side][k];
       const card = sides[side].field[i];
-      if (!card) continue;
-      if (--card.cd <= 0) { card.cd = attackInterval(card); swinging.push([side, i]); }
+      if (card) yield { side, slot: i, card };
     }
+}
 
-  const blows = [];
-  for (const [side, i] of swinging) {
-    const attacker = sides[side].field[i];
-    const t = targetFor(side);
-    if (t < 0) continue;
-    blows.push({ side, slot: i, toSide: other(side), toSlot: t, dmg: attacker.atk });
+// A tick runs in four phases, each its own function below. They are separate
+// because each one has to leave a SETTLED BOARD behind it: no half-applied
+// damage, no corpses still standing. That is what makes a run readable — and it
+// is the same property triggers will need when they arrive (see phaseStrike).
+//
+// The runner plays them one at a time, so `data` accumulates across the four
+// and is thrown away at the end of the tick.
+function newTickData() { return { charged: [], ready: [], blows: [], dead: [] }; }
+
+// PHASE 1 — CHARGE. Every unit's cooldown drops by one; anything reaching zero
+// is ready to swing. Nothing is spent here: the cooldown is not reset until the
+// blow actually lands in STRIKE, so a ready unit reads as a full row of pips
+// for the whole of DECLARE instead of blanking the instant it fires.
+//
+// Charging is simultaneous — no unit's cooldown depends on another's — but
+// twelve pips filling on one frame is a wall of movement nobody can read, so
+// `charged` keeps the walk order and the phase plays it back one unit at a
+// time. The sweep is the resolution order itself, which is worth seeing: it is
+// the tiebreak that will decide trigger queue order.
+function phaseCharge(data) {
+  data.charged = [];
+  data.ready   = [];
+  for (const u of units()) {
+    u.card.cd--;
+    const order = data.charged.length;
+    data.charged.push({ side: u.side, slot: u.slot, card: u.card, order });
+    if (u.card.cd <= 0) data.ready.push({ side: u.side, slot: u.slot, order });
   }
+  return data.ready.length;
+}
 
-  // nothing is removed until phase 4, so two blows on one unit both land
-  for (const b of blows) {
+// PHASE 2 — DECLARE. Each ready unit locks a target against the board as it
+// stands, before any damage moves. Targeting is uniformly random across living
+// enemies, so this is the phase to watch when a run looks unfair.
+function phaseDeclare(data) {
+  data.blows = [];
+  for (const { side, slot } of data.ready) {
+    const attacker = sides[side].field[slot];
+    if (!attacker) continue;
+    const target = targetFor(side);
+    if (target < 0) continue;   // nothing left to hit
+    data.blows.push({
+      side, slot, toSide: other(side), toSlot: target, dmg: attacker.atk,
+    });
+  }
+  return data.blows.length;
+}
+
+// PHASE 3 — STRIKE. Every declared blow lands at once, so neither side resolves
+// "first". Damage is simultaneous because no sequential order can be fair:
+// whoever swings first removes their own retaliator. In mirror matches,
+// resolving all of one side first won 84% of games, and interleaving by slot
+// still won 68%.
+//
+// Nothing is removed here — a unit already at 0 hp still takes the second blow
+// aimed at it, and does not leave the board until CLEANUP.
+//
+// TRIGGERS, when they arrive, do NOT go in this phase. They belong in a queue
+// drained after it — and again after CLEANUP for death triggers — resolving one
+// event at a time in the order queued. That is what keeps them legible: an
+// effect always reads a settled board, never one that is half updated. CHARGE's
+// row-major walk (frontline left to right, then backline) is what decides that
+// queue order, so it stays a tiebreak rather than an advantage.
+function phaseStrike(data) {
+  for (const { side, slot } of data.ready) {
+    const card = sides[side].field[slot];
+    if (card) card.cd = attackInterval(card);
+  }
+  for (const b of data.blows) {
     const victim = sides[b.toSide].field[b.toSlot];
     if (victim) victim.hp -= b.dmg;
   }
-
-  const dead = [];
-  for (let k = 0; k < SLOTS; k++)
-    for (const side of SIDES) {
-      const i = RESOLUTION_ORDER[side][k];
-      const card = sides[side].field[i];
-      if (card && card.hp <= 0) { dead.push({ side, slot: i, card }); kill(side, i); }
-    }
-
-  return { blows, dead };
+  return data.blows.length;
 }
+
+// PHASE 4 — CLEANUP. Anything at or below 0 hp dies. Collected before any of it
+// is removed, so the walk reads one settled board rather than a shrinking one.
+function phaseCleanup(data) {
+  data.dead = [];
+  for (const u of units())
+    if (u.card.hp <= 0) data.dead.push({ side: u.side, slot: u.slot, card: u.card });
+  for (const d of data.dead) kill(d.side, d.slot);
+  return data.dead.length;
+}
+
+// CHARGE sweeps one unit at a time, so it is the one phase whose length depends
+// on the board: CHARGE_STEP per unit, then a fifth of the phase again as a pause
+// on the settled result.
+const CHARGE_STEP  = 105;   // ms per unit in the sweep
+const CHARGE_SWEEP = 0.8;   // fraction of the phase the sweep occupies
+
+function chargeMs(data) {
+  return Math.max(520, (data.charged.length * CHARGE_STEP) / CHARGE_SWEEP);
+}
+
+// ms  — how long the phase plays for when running, or a function of the tick
+// hold— where its animation freezes when stepped, picked as the moment the
+//       phase reads best: lunges extended, corpses half faded.
+// A phase that produced nothing is skipped rather than given a beat of its own,
+// except CHARGE, which always has pips to move.
+const PHASES = [
+  { key: 'charge',  label: 'CHARGE',  ms: chargeMs, hold: 1,
+    tally: n => `${n} ready`,
+    blurb: ['cooldowns drop by one —', 'swept in resolution order'] },
+  { key: 'declare', label: 'DECLARE', ms: 950, hold: 1,
+    tally: n => `${n} declared`,
+    blurb: ['each swinger locks a target', 'on the board as it stands'] },
+  { key: 'strike',  label: 'STRIKE',  ms: 900, hold: 0.32,
+    tally: n => `${n} landed`,
+    blurb: ['every blow lands at once,', 'so neither side goes first'] },
+  { key: 'cleanup', label: 'CLEANUP', ms: 780, hold: 0.5,
+    tally: n => (n ? `${n} dies` : 'none'),
+    blurb: ['anything at or below 0 hp', 'goes to the graveyard'] },
+];
+
+const PHASE_RUN = {
+  charge: phaseCharge, declare: phaseDeclare,
+  strike: phaseStrike, cleanup: phaseCleanup,
+};
 
 function fieldCount(side) { return sides[side].field.filter(Boolean).length; }
 
@@ -422,27 +501,65 @@ function drawCrown(x, y) {
   ctx.restore();
 }
 
+// How far the CHARGE sweep has got to the unit at `order` in the walk: below 0
+// it has not reached them, above 1 they have settled. Only meaningful inside
+// the charge phase, which is the only place it is called from.
+function chargeProgress(order) {
+  const n = sim.data.charged.length || 1;
+  const each = CHARGE_SWEEP / n;
+  return (sim.t - order * each) / each;
+}
+
+// A card the sweep has not reached yet still shows last tick's cooldown, so its
+// pip lands when its turn comes rather than on the frame the phase began.
+function chargeEntry(card) {
+  return inPhase('charge')
+    ? sim.data.charged.find(e => e.card === card)
+    : undefined;
+}
+
+function displayCd(card) {
+  const e = chargeEntry(card);
+  return e && chargeProgress(e.order) <= 0 ? card.cd + 1 : card.cd;
+}
+
+// 1 the moment a pip lands, easing to 0 — the newest pip swells as it arrives
+function chargePop(card) {
+  const e = chargeEntry(card);
+  if (!e) return 0;
+  const p = chargeProgress(e.order);
+  return p > 0 && p < 1 ? 1 - p : 0;
+}
+
 // One pip per tick of the unit's attack interval, filling as it charges. A SPD 5
 // unit shows a single pip that fills every tick; a SPD 1 unit shows five.
 function drawCharge(card, x, y) {
   const total  = attackInterval(card);
-  const filled = Math.max(0, Math.min(total, total - card.cd));
+  const filled = Math.max(0, Math.min(total, total - displayCd(card)));
+  const pop    = chargePop(card);
   const r = 4.5, gap = 5;
   const w = total * (r * 2) + (total - 1) * gap;
   let px = x + (CARD_W - w) / 2 + r;
   const py = y + 45;
 
   for (let i = 0; i < total; i++) {
+    const landing = pop > 0 && i === filled - 1;
+    ctx.save();
+    if (landing) {
+      ctx.shadowColor = '#6aa8e0';
+      ctx.shadowBlur  = 10 * pop;
+    }
     ctx.beginPath();
-    ctx.arc(px, py, r, 0, Math.PI * 2);
+    ctx.arc(px, py, landing ? r * (1 + 0.8 * pop) : r, 0, Math.PI * 2);
     if (i < filled) {
-      ctx.fillStyle = '#4a7fb5';
+      ctx.fillStyle = landing ? '#6aa8e0' : '#4a7fb5';
       ctx.fill();
     } else {
       ctx.strokeStyle = 'rgba(30,35,42,0.30)';
       ctx.lineWidth = 1.5;
       ctx.stroke();
     }
+    ctx.restore();
     px += r * 2 + gap;
   }
 }
@@ -586,39 +703,158 @@ function drawGrave(side) {
   ctx.fillText(n, bx + bw / 2, by + bh / 2 + 1);
 }
 
-// --- tick animation ---------------------------------------------------------
+// --- phase animation --------------------------------------------------------
 //
-// anim holds the events of the tick currently on screen, animT its progress
-// through that tick. Both are null/1 when nothing is running, so every other
-// caller of draw() is unaffected.
+// Each phase draws only its own cue, so what is on screen at any moment is the
+// work of exactly one phase. `sim` is null whenever nothing is running, which
+// leaves every other caller of draw() untouched.
 
-let anim  = null;
-let animT = 1;
+// how far through the current phase, 0..1, or 0 if that phase is not on screen
+function phaseT(key) {
+  return sim && PHASES[sim.phase].key === key ? sim.t : 0;
+}
+function inPhase(key) { return !!sim && PHASES[sim.phase].key === key; }
+
+const READY_COLOUR = '#6aa8e0';   // matches the charge pips
+const AIM_COLOUR   = '#e8735f';   // matches the damage numbers
+
+// CHARGE — a ring around everything whose cooldown just hit zero. Each ring
+// arrives with the sweep, so they appear one at a time rather than twelve on
+// one frame, and stay up once lit.
+function drawReady() {
+  if (!inPhase('charge')) return;
+  ctx.save();
+  ctx.strokeStyle = READY_COLOUR;
+  ctx.shadowColor = READY_COLOUR;
+  ctx.lineWidth   = 3;
+
+  for (const { side, slot, order } of sim.data.ready) {
+    const p = chargeProgress(order);
+    if (p <= 0) continue;
+    const lit = Math.min(1, p);
+    ctx.globalAlpha = lit;
+    ctx.shadowBlur  = 12;
+    // the ring snaps in tight around the card as it lights
+    const grow = 4 + 6 * (1 - lit);
+    const { x, y } = slotPos(side, slot);
+    roundRect(x - grow, y - grow, CARD_W + grow * 2, CARD_H + grow * 2, 9 + grow);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function cardCentre(side, slot) {
+  const { x, y } = slotPos(side, slot);
+  return { x: x + CARD_W / 2, y: y + CARD_H / 2 };
+}
+
+// where a ray leaving a card's centre crosses that card's edge, plus padding
+function edgePoint(c, dx, dy, pad) {
+  const s = Math.min(dx ? (CARD_W / 2 + pad) / Math.abs(dx) : Infinity,
+                     dy ? (CARD_H / 2 + pad) / Math.abs(dy) : Infinity);
+  return { x: c.x + dx * s, y: c.y + dy * s };
+}
+
+// DECLARE — one arrow per locked blow. Several blows on one victim fan apart so
+// each stays its own line, and the arrows linger into STRIKE, fading out as the
+// lunges begin, so the two phases read as one movement.
+function drawAims() {
+  const declaring = inPhase('declare');
+  if (!declaring && !inPhase('strike')) return;
+
+  const alpha = declaring ? Math.min(1, sim.t * 4)
+                          : Math.max(0, 1 - sim.t / 0.3);
+  if (alpha <= 0) return;
+  const grow = declaring ? Math.min(1, sim.t / 0.6) : 1;
+
+  // count first, so a fan can be centred on the line it spreads around
+  const total = {}, seen = {};
+  for (const b of sim.data.blows) {
+    const key = `${b.toSide}:${b.toSlot}`;
+    total[key] = (total[key] || 0) + 1;
+  }
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  // a reticle on everything about to be hit
+  ctx.setLineDash([5, 4]);
+  ctx.strokeStyle = AIM_COLOUR;
+  ctx.lineWidth = 2;
+  for (const key of Object.keys(total)) {
+    const [side, slot] = key.split(':');
+    const { x, y } = slotPos(side, +slot);
+    roundRect(x - 5, y - 5, CARD_W + 10, CARD_H + 10, 12);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  for (const b of sim.data.blows) {
+    const key = `${b.toSide}:${b.toSlot}`;
+    const i   = seen[key] = (seen[key] || 0) + 1;
+    const off = (i - 1 - (total[key] - 1) / 2) * 15;
+
+    const from = cardCentre(b.side, b.slot);
+    const to   = cardCentre(b.toSide, b.toSlot);
+    const len  = Math.hypot(to.x - from.x, to.y - from.y) || 1;
+    const dx = (to.x - from.x) / len, dy = (to.y - from.y) / len;
+
+    // slide both ends along the perpendicular, keeping the arrows parallel
+    const shift = { x: -dy * off, y: dx * off };
+    const a = edgePoint({ x: from.x + shift.x, y: from.y + shift.y }, dx, dy, 4);
+    const z = edgePoint({ x: to.x + shift.x,   y: to.y + shift.y }, -dx, -dy, 7);
+
+    const tip = { x: a.x + (z.x - a.x) * grow, y: a.y + (z.y - a.y) * grow };
+
+    ctx.strokeStyle = AIM_COLOUR;
+    ctx.fillStyle   = AIM_COLOUR;
+    ctx.lineWidth   = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(tip.x, tip.y);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(a.x, a.y, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    const head = 9;
+    ctx.beginPath();
+    ctx.moveTo(tip.x, tip.y);
+    ctx.lineTo(tip.x - dx * head - dy * head * 0.55,
+               tip.y - dy * head + dx * head * 0.55);
+    ctx.lineTo(tip.x - dx * head + dy * head * 0.55,
+               tip.y - dy * head - dx * head * 0.55);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
 
 const LUNGE = 24;
 
-// out and back over the first half of the tick
+// out and back over the first half of the strike
 function lungeCurve(t) { return Math.sin(Math.PI * Math.min(t * 2, 1)); }
 
 function lungeOffset(side, slot) {
-  if (!anim) return { x: 0, y: 0 };
-  const blow = anim.blows.find(b => b.side === side && b.slot === slot);
+  if (!inPhase('strike')) return { x: 0, y: 0 };
+  const blow = sim.data.blows.find(b => b.side === side && b.slot === slot);
   if (!blow) return { x: 0, y: 0 };
 
   const from = slotPos(side, slot);
   const to   = slotPos(blow.toSide, blow.toSlot);
   const dx = to.x - from.x, dy = to.y - from.y;
   const len = Math.hypot(dx, dy) || 1;
-  const amp = LUNGE * lungeCurve(animT);
+  const amp = LUNGE * lungeCurve(sim.t);
   return { x: (dx / len) * amp, y: (dy / len) * amp };
 }
 
-// units removed this tick keep their place while they fade
+// CLEANUP — units removed this tick keep their place while they fade
 function drawDying() {
-  if (!anim) return;
-  const fade = animT < 0.45 ? 1 : 1 - (animT - 0.45) / 0.55;
+  if (!inPhase('cleanup')) return;
+  const fade = 1 - Math.max(0, (sim.t - 0.15) / 0.85);
 
-  for (const d of anim.dead) {
+  for (const d of sim.data.dead) {
     const { x, y } = slotPos(d.side, d.slot);
     ctx.save();
     ctx.globalAlpha = Math.max(0, fade);
@@ -627,11 +863,11 @@ function drawDying() {
   }
 }
 
-// damage floats up off whoever took it
+// STRIKE — damage floats up off whoever took it
 function drawDamage() {
-  if (!anim) return;
-  const rise = 26 * animT;
-  const fade = animT < 0.35 ? 1 : 1 - (animT - 0.35) / 0.65;
+  if (!inPhase('strike')) return;
+  const rise = 26 * sim.t;
+  const fade = sim.t < 0.45 ? 1 : 1 - (sim.t - 0.45) / 0.55;
   if (fade <= 0) return;
 
   const stacked = {};
@@ -641,7 +877,7 @@ function drawDamage() {
   ctx.textBaseline = 'middle';
   ctx.font = 'bold 22px system-ui, sans-serif';
 
-  for (const b of anim.blows) {
+  for (const b of sim.data.blows) {
     const key = `${b.toSide}:${b.toSlot}`;
     const n = stacked[key] = (stacked[key] || 0) + 1;
     const { x, y } = slotPos(b.toSide, b.toSlot);
@@ -654,6 +890,90 @@ function drawDamage() {
     ctx.fillStyle   = '#e8615a';
     ctx.fillText(`-${b.dmg}`, px, py);
   }
+  ctx.restore();
+}
+
+// --- phase tracker ----------------------------------------------------------
+//
+// The four phases listed down the left margin, the current one lit, each
+// showing what it turned up. The margin is empty between the two graveyards,
+// so the panel never covers a card.
+
+const PANEL = { x: 12, y: 282, w: 206, rowH: 34 };
+
+function drawPhasePanel() {
+  if (!sim) return;
+  const { x, y, w, rowH } = PANEL;
+  const h = 30 + PHASES.length * rowH + 42;
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(16,19,25,0.78)';
+  roundRect(x, y, w, h, 10);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.09)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  ctx.textBaseline = 'middle';
+  ctx.textAlign    = 'left';
+  ctx.font         = 'bold 11px system-ui, sans-serif';
+  ctx.fillStyle    = '#7d8798';
+  ctx.fillText(`TICK ${sim.tickNo} / ${TICKS}`, x + 14, y + 19);
+
+  if (sim.paused) {
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#e0b64a';
+    ctx.fillText('PAUSED', x + w - 14, y + 19);
+    ctx.textAlign = 'left';
+  }
+
+  PHASES.forEach((ph, i) => {
+    const ry      = y + 30 + i * rowH;
+    const cy      = ry + rowH / 2;
+    const current = i === sim.phase;
+    const past    = i < sim.phase;
+
+    if (current) {
+      ctx.fillStyle = 'rgba(224,182,74,0.13)';
+      roundRect(x + 6, ry + 2, w - 12, rowH - 4, 6);
+      ctx.fill();
+    }
+
+    ctx.beginPath();
+    ctx.arc(x + 22, cy, 4.5, 0, Math.PI * 2);
+    if (current)   { ctx.fillStyle = '#e0b64a'; ctx.fill(); }
+    else if (past) { ctx.fillStyle = 'rgba(255,255,255,0.34)'; ctx.fill(); }
+    else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+      ctx.lineWidth   = 1.5;
+      ctx.stroke();
+    }
+
+    ctx.font      = `${current ? 'bold ' : ''}13px system-ui, sans-serif`;
+    ctx.fillStyle = current ? '#f0e4c4' : past ? '#8f97a3' : '#5d6472';
+    ctx.fillText(ph.label, x + 38, cy);
+
+    let n = sim.counts[ph.key];
+    // the ready count follows the sweep instead of jumping to the total, so the
+    // panel and the board agree on how far through the phase you are
+    if (n !== undefined && current && ph.key === 'charge')
+      n = sim.data.ready.filter(r => chargeProgress(r.order) > 0).length;
+
+    if (n !== undefined) {
+      ctx.textAlign = 'right';
+      ctx.font      = '11px system-ui, sans-serif';
+      ctx.fillStyle = current ? '#e0b64a' : '#6f7787';
+      ctx.fillText(ph.tally(n), x + w - 14, cy);
+      ctx.textAlign = 'left';
+    }
+  });
+
+  const by = y + 30 + PHASES.length * rowH + 4;
+  ctx.font      = '11px system-ui, sans-serif';
+  ctx.fillStyle = '#7d8798';
+  PHASES[sim.phase].blurb.forEach((line, i) =>
+    ctx.fillText(line, x + 14, by + 11 + i * 14));
+
   ctx.restore();
 }
 
@@ -689,8 +1009,12 @@ function draw() {
     }
   }
 
+  // phase cues sit on top of the board, one phase's worth at a time
+  drawReady();
+  drawAims();
   drawDying();
   drawDamage();
+  drawPhasePanel();
 }
 
 // --- input ------------------------------------------------------------------
@@ -771,12 +1095,64 @@ cv.addEventListener('click', e => {
 
 // --- simulation runner ------------------------------------------------------
 
-const simBtn = document.getElementById('sim');
+const simBtn   = document.getElementById('sim');
+const playBtn  = document.getElementById('play');
+const stepBtn  = document.getElementById('step');
 const statusEl = document.getElementById('status');
 
 function setStatus(t) { statusEl.textContent = t; }
 
-function startSim() {
+// The whole run lives here: which tick, which of its four phases, and how far
+// through that phase we are. Null whenever nothing is running.
+//   sim.t      0..1 through the current phase
+//   sim.data   what this tick's phases have turned up so far
+//   sim.counts what each phase of this tick returned, for the panel
+let sim = null;
+let lastFrame = 0;
+
+function syncButtons() {
+  simBtn.disabled  = simulating;
+  playBtn.disabled = !simulating;
+  playBtn.textContent = sim && !sim.paused ? '⏸ Pause' : '▶ Play';
+}
+
+function syncStatus() {
+  if (!sim) return;
+  setStatus(`tick ${sim.tickNo} / ${TICKS} · ${PHASES[sim.phase].label}` +
+            (sim.paused ? ' · paused' : ''));
+}
+
+// Runs the phase, then hands its animation the screen. A phase that turned
+// nothing up is not worth a beat, so it hands straight on — except CHARGE,
+// which always has pips to move.
+function enterPhase(index) {
+  sim.phase  = index;
+  const ph   = PHASES[index];
+  const n    = PHASE_RUN[ph.key](sim.data);
+  sim.counts[ph.key] = n;
+  sim.t = 0;
+
+  if (!n && ph.key !== 'charge') { nextPhase(); return; }
+  syncStatus();
+}
+
+function nextPhase() {
+  if (sim.phase + 1 < PHASES.length) { enterPhase(sim.phase + 1); return; }
+
+  // the tick is over, and the board is settled — the only place a run can end
+  const done = outcome();
+  if (done || sim.tickNo >= TICKS) { finishSim(done); return; }
+  beginTick();
+}
+
+function beginTick() {
+  sim.tickNo++;
+  sim.data   = newTickData();
+  sim.counts = {};
+  enterPhase(0);
+}
+
+function startSim(paused) {
   if (simulating) return;
   if (!fieldCount('top') || !fieldCount('bottom')) {
     setStatus('needs units on both sides');
@@ -786,49 +1162,85 @@ function startSim() {
   simulating = true;
   sel = null;
   hover = null;
-  simBtn.disabled = true;
 
   // every unit starts its first swing from a full cooldown
   for (const side of SIDES)
     for (const card of sides[side].field) if (card) card.cd = attackInterval(card);
 
-  simTicks  = 0;
-  anim      = null;
-  animT     = 1;
-  tickStart = performance.now() - TICK_MS;   // so the first frame runs a tick
-  requestAnimationFrame(frame);
+  sim = { tickNo: 0, phase: 0, t: 0, paused, data: newTickData(), counts: {} };
+  lastFrame = performance.now();
+  beginTick();
+
+  if (simulating) {   // a one-sided board can finish inside the first tick
+    syncButtons();
+    requestAnimationFrame(frame);
+  }
 }
 
+// Stopping is safe at any phase boundary: each phase leaves a settled board, so
+// there is never half-applied damage to unwind.
 function finishSim(done) {
+  const at = sim ? sim.tickNo : 0;
   simulating = false;
-  anim  = null;
-  animT = 1;
-  simBtn.disabled = false;
-  setStatus(done ? `${done} — tick ${simTicks}` : `${TICKS} ticks complete`);
+  sim = null;
+  syncButtons();
+  setStatus(done ? `${done} — tick ${at}` : `${TICKS} ticks complete`);
   draw();
+}
+
+function stopSim() {
+  const at = sim.tickNo, phase = PHASES[sim.phase].label.toLowerCase();
+  finishSim(null);
+  setStatus(`stopped after tick ${at} ${phase}`);
 }
 
 function frame(now) {
   if (!simulating) return;
+  const dt = Math.min(64, now - lastFrame);   // a backgrounded tab must not skip
+  lastFrame = now;
 
-  if (now - tickStart >= TICK_MS) {
-    const done = outcome();
-    if (simTicks >= TICKS || done) { finishSim(done); return; }
-
-    anim = tick();
-    simTicks++;
-    tickStart = now;
-    setStatus(`tick ${simTicks} / ${TICKS}`);
+  const ph = PHASES[sim.phase];
+  const ms = typeof ph.ms === 'function' ? ph.ms(sim.data) : ph.ms;
+  // paused, the phase still animates — it just settles at its most readable
+  // moment instead of running on into the next one
+  sim.t = Math.min(sim.paused ? ph.hold : 1, sim.t + dt / ms);
+  if (!sim.paused && sim.t >= 1) {
+    nextPhase();
+    if (!simulating) return;
   }
 
-  animT = Math.min(1, (now - tickStart) / TICK_MS);
   draw();
   requestAnimationFrame(frame);
 }
 
-simBtn.textContent = `Simulate ${TICKS} tick${TICKS === 1 ? '' : 's'}`;
-simBtn.addEventListener('click', startSim);
+function togglePlay() {
+  if (!simulating) return;
+  sim.paused = !sim.paused;
+  syncButtons();
+  syncStatus();
+}
 
+function stepPhase() {
+  if (!simulating) { startSim(true); return; }
+  sim.paused = true;
+  nextPhase();
+  if (simulating) { syncButtons(); syncStatus(); draw(); }
+}
+
+simBtn.textContent  = `Simulate ${TICKS} tick${TICKS === 1 ? '' : 's'}`;
+stepBtn.textContent = '⏭ Step';
+simBtn.addEventListener('click', () => startSim(false));
+playBtn.addEventListener('click', togglePlay);
+stepBtn.addEventListener('click', stepPhase);
+
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'BUTTON') e.target.blur();   // space must not re-click
+  if (e.key === ' ')          { e.preventDefault(); simulating ? togglePlay() : startSim(false); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); stepPhase(); }
+  else if (e.key === 'Escape' && simulating) stopSim();
+});
+
+syncButtons();
 for (const side of SIDES) for (let i = 0; i < 5; i++) drawFromDeck(side);
 draw();
 </script>

@@ -302,7 +302,9 @@ function* units() {
 //
 // The runner plays them one at a time, so `data` accumulates across the four
 // and is thrown away at the end of the tick.
-function newTickData() { return { charged: [], ready: [], blows: [], dead: [] }; }
+function newTickData() {
+  return { charged: [], ready: [], blows: [], dead: [], hpBefore: new Map() };
+}
 
 // PHASE 1 — CHARGE. Every unit's cooldown drops by one; anything reaching zero
 // is ready to swing. Nothing is spent here: the cooldown is not reset until the
@@ -338,6 +340,7 @@ function phaseDeclare(data) {
     if (target < 0) continue;   // nothing left to hit
     data.blows.push({
       side, slot, toSide: other(side), toSlot: target, dmg: attacker.atk,
+      order: data.blows.length,   // its place in the STRIKE playback, below
     });
   }
   return data.blows.length;
@@ -350,7 +353,17 @@ function phaseDeclare(data) {
 // still won 68%.
 //
 // Nothing is removed here — a unit already at 0 hp still takes the second blow
-// aimed at it, and does not leave the board until CLEANUP.
+// aimed at it, and does not leave the board until CLEANUP. Nor does being dead
+// stop a unit swinging: its blow was locked in DECLARE and lands like any other.
+//
+// All of that resolves on this one call. The phase then PLAYS IT BACK one blow
+// at a time, because a dozen lunges on a single frame is unreadable — but the
+// playback is presentation only, and is built so it cannot be misread as
+// sequential resolution: every arrow stays on screen for the whole phase, so
+// the full set of locked-in blows is always visible, and a unit reduced to 0
+// still throws its own blow later in the sweep. `hpBefore` is what lets the
+// display walk the totals down in step with the playback instead of dropping
+// them all on the opening frame.
 //
 // TRIGGERS, when they arrive, do NOT go in this phase. They belong in a queue
 // drained after it — and again after CLEANUP for death triggers — resolving one
@@ -365,7 +378,10 @@ function phaseStrike(data) {
   }
   for (const b of data.blows) {
     const victim = sides[b.toSide].field[b.toSlot];
-    if (victim) victim.hp -= b.dmg;
+    if (!victim) continue;
+    if (!data.hpBefore.has(victim)) data.hpBefore.set(victim, victim.hp);
+    b.victim = victim;   // held for the playback, which walks hp down in order
+    victim.hp -= b.dmg;
   }
   return data.blows.length;
 }
@@ -380,14 +396,24 @@ function phaseCleanup(data) {
   return data.dead.length;
 }
 
-// CHARGE sweeps one unit at a time, so it is the one phase whose length depends
-// on the board: CHARGE_STEP per unit, then a fifth of the phase again as a pause
-// on the settled result.
+// CHARGE and STRIKE both play one unit at a time, so their length depends on the
+// board rather than being fixed: a step per item, then the rest of the phase as
+// a pause on the settled result. Everything about them is playback — the phase
+// function itself has already resolved in full before the first frame.
 const CHARGE_STEP  = 105;   // ms per unit in the sweep
 const CHARGE_SWEEP = 0.8;   // fraction of the phase the sweep occupies
+const STRIKE_STEP  = 170;   // ms per blow — slower, there is more to take in
+const STRIKE_SWEEP = 0.78;
+
+// where in its own slice a blow actually connects: the lunge is fully extended,
+// and this is the moment its damage comes off the victim's total
+const STRIKE_IMPACT = 0.5;
 
 function chargeMs(data) {
   return Math.max(520, (data.charged.length * CHARGE_STEP) / CHARGE_SWEEP);
+}
+function strikeMs(data) {
+  return Math.max(760, (data.blows.length * STRIKE_STEP) / STRIKE_SWEEP);
 }
 
 // ms  — how long the phase plays for when running, or a function of the tick
@@ -402,9 +428,9 @@ const PHASES = [
   { key: 'declare', label: 'DECLARE', ms: 950, hold: 1,
     tally: n => `${n} declared`,
     blurb: ['each swinger locks a target', 'on the board as it stands'] },
-  { key: 'strike',  label: 'STRIKE',  ms: 900, hold: 0.32,
+  { key: 'strike',  label: 'STRIKE',  ms: strikeMs, hold: 1,
     tally: n => `${n} landed`,
-    blurb: ['every blow lands at once,', 'so neither side goes first'] },
+    blurb: ['all locked at once — a unit', 'dying here still swings'] },
   { key: 'cleanup', label: 'CLEANUP', ms: 780, hold: 0.5,
     tally: n => (n ? `${n} dies` : 'none'),
     blurb: ['anything at or below 0 hp', 'goes to the graveyard'] },
@@ -444,7 +470,7 @@ const STAT_STRIP = 40;
 const STATS = [
   ['ATK', c => c.atk, '#b4463c'],
   ['SPD', c => c.spd, '#4a7fb5'],
-  ['HP',  c => c.hp,  '#3f8a5c'],
+  ['HP',  c => displayHp(c), '#3f8a5c'],
   ['DPS', c => (c.atk / attackInterval(c)).toFixed(1), '#c98a3c'],
 ];
 
@@ -521,6 +547,29 @@ function chargeEntry(card) {
 function displayCd(card) {
   const e = chargeEntry(card);
   return e && chargeProgress(e.order) <= 0 ? card.cd + 1 : card.cd;
+}
+
+// How far the STRIKE playback has got to the blow at `order`: below 0 it has not
+// been thrown, above 1 it is spent. The same shape as chargeProgress.
+function strikeProgress(order) {
+  const n = sim.data.blows.length || 1;
+  const each = STRIKE_SWEEP / n;
+  return (sim.t - order * each) / each;
+}
+
+// Damage came off the moment STRIKE resolved, but showing all of it at once
+// would drop a unit's HP before you saw the blow that did it. So during the
+// phase the number counts down in step with the playback — the board's real
+// state is already final underneath.
+function displayHp(card) {
+  if (!inPhase('strike')) return card.hp;
+  const before = sim.data.hpBefore.get(card);
+  if (before === undefined) return card.hp;
+
+  let hp = before;
+  for (const b of sim.data.blows)
+    if (b.victim === card && strikeProgress(b.order) >= STRIKE_IMPACT) hp -= b.dmg;
+  return hp;
 }
 
 // 1 the moment a pip lands, easing to 0 — the newest pip swells as it arrives
@@ -755,16 +804,22 @@ function edgePoint(c, dx, dy, pad) {
   return { x: c.x + dx * s, y: c.y + dy * s };
 }
 
-// DECLARE — one arrow per locked blow. Several blows on one victim fan apart so
-// each stays its own line, and the arrows linger into STRIKE, fading out as the
-// lunges begin, so the two phases read as one movement.
+// One arrow per locked blow, drawn across BOTH declare and strike. Several
+// blows on one victim fan apart so each stays its own line.
+//
+// Holding every arrow on screen through the whole of STRIKE is what keeps the
+// one-at-a-time playback honest: the complete set of blows was fixed before any
+// of them moved, and you can see all of it the entire time. An arrow is dim
+// while its blow is pending, flares as it lands, and goes spent-dim after —
+// so the sweep reads as attention moving over a settled decision, not as blows
+// being decided in turn.
 function drawAims() {
   const declaring = inPhase('declare');
-  if (!declaring && !inPhase('strike')) return;
+  const striking  = inPhase('strike');
+  if (!declaring && !striking) return;
 
-  const alpha = declaring ? Math.min(1, sim.t * 4)
-                          : Math.max(0, 1 - sim.t / 0.3);
-  if (alpha <= 0) return;
+  const phaseAlpha = declaring ? Math.min(1, sim.t * 4) : 1;
+  if (phaseAlpha <= 0) return;
   const grow = declaring ? Math.min(1, sim.t / 0.6) : 1;
 
   // count first, so a fan can be centred on the line it spreads around
@@ -775,21 +830,31 @@ function drawAims() {
   }
 
   ctx.save();
-  ctx.globalAlpha = alpha;
+  ctx.globalAlpha = phaseAlpha;
 
-  // a reticle on everything about to be hit
-  ctx.setLineDash([5, 4]);
-  ctx.strokeStyle = AIM_COLOUR;
-  ctx.lineWidth = 2;
-  for (const key of Object.keys(total)) {
-    const [side, slot] = key.split(':');
-    const { x, y } = slotPos(side, +slot);
-    roundRect(x - 5, y - 5, CARD_W + 10, CARD_H + 10, 12);
-    ctx.stroke();
+  // a reticle on everything about to be hit — declare only, since once the
+  // blows start landing the arrows themselves carry it
+  if (declaring) {
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = AIM_COLOUR;
+    ctx.lineWidth = 2;
+    for (const key of Object.keys(total)) {
+      const [side, slot] = key.split(':');
+      const { x, y } = slotPos(side, +slot);
+      roundRect(x - 5, y - 5, CARD_W + 10, CARD_H + 10, 12);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
   }
-  ctx.setLineDash([]);
 
   for (const b of sim.data.blows) {
+    if (striking) {
+      const p = strikeProgress(b.order);
+      // pending, landing, spent
+      ctx.globalAlpha = p <= 0 ? 0.30
+                      : p <  1 ? 0.30 + 0.70 * (1 - p)
+                      : 0.12;
+    }
     const key = `${b.toSide}:${b.toSlot}`;
     const i   = seen[key] = (seen[key] || 0) + 1;
     const off = (i - 1 - (total[key] - 1) / 2) * 15;
@@ -833,20 +898,43 @@ function drawAims() {
 
 const LUNGE = 24;
 
-// out and back over the first half of the strike
-function lungeCurve(t) { return Math.sin(Math.PI * Math.min(t * 2, 1)); }
+// out and back across the blow's own slice of the phase, peaking at impact
+function lungeCurve(p) { return Math.sin(Math.PI * p); }
 
+// Each unit lunges only in its turn, and each declares at most one blow, so
+// there is never more than one lunge to find per slot.
 function lungeOffset(side, slot) {
   if (!inPhase('strike')) return { x: 0, y: 0 };
   const blow = sim.data.blows.find(b => b.side === side && b.slot === slot);
   if (!blow) return { x: 0, y: 0 };
 
+  const p = strikeProgress(blow.order);
+  if (p <= 0 || p >= 1) return { x: 0, y: 0 };   // not yet, or already back
+
   const from = slotPos(side, slot);
   const to   = slotPos(blow.toSide, blow.toSlot);
   const dx = to.x - from.x, dy = to.y - from.y;
   const len = Math.hypot(dx, dy) || 1;
-  const amp = LUNGE * lungeCurve(sim.t);
+  const amp = LUNGE * lungeCurve(p);
   return { x: (dx / len) * amp, y: (dy / len) * amp };
+}
+
+// A unit on 0 hp part way through STRIKE is dead but still standing — it does
+// not leave until CLEANUP, and if it declared a blow it still throws it. Marking
+// it is the clearest proof on screen that the exchange is simultaneous: you can
+// watch a corpse hit back.
+function drawDoomed(x, y) {
+  ctx.save();
+  roundRect(x, y, CARD_W, CARD_H, 9);
+  ctx.clip();
+  ctx.fillStyle = 'rgba(150,32,30,0.32)';
+  ctx.fillRect(x, y, CARD_W, CARD_H);
+  ctx.restore();
+
+  ctx.strokeStyle = 'rgba(232,97,90,0.9)';
+  ctx.lineWidth   = 2;
+  roundRect(x, y, CARD_W, CARD_H, 9);
+  ctx.stroke();
 }
 
 // CLEANUP — units removed this tick keep their place while they fade
@@ -863,27 +951,33 @@ function drawDying() {
   }
 }
 
-// STRIKE — damage floats up off whoever took it
+// STRIKE — damage floats up off whoever took it, each number appearing on its
+// own blow's impact. A number outlives its slice, so several can be up at once
+// on a unit taking more than one hit; they stack sideways to stay readable.
+const DAMAGE_LIFE = 1.6;   // in slices
+
 function drawDamage() {
   if (!inPhase('strike')) return;
-  const rise = 26 * sim.t;
-  const fade = sim.t < 0.45 ? 1 : 1 - (sim.t - 0.45) / 0.55;
-  if (fade <= 0) return;
 
   const stacked = {};
   ctx.save();
-  ctx.globalAlpha = fade;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.font = 'bold 22px system-ui, sans-serif';
 
   for (const b of sim.data.blows) {
+    const p = strikeProgress(b.order);
+    if (p < STRIKE_IMPACT) continue;                      // not landed yet
+    const age = (p - STRIKE_IMPACT) / DAMAGE_LIFE;
+    if (age >= 1) continue;                               // long gone
+
     const key = `${b.toSide}:${b.toSlot}`;
     const n = stacked[key] = (stacked[key] || 0) + 1;
     const { x, y } = slotPos(b.toSide, b.toSlot);
     const px = x + CARD_W / 2 + (n - 1) * 22;
-    const py = y + 30 - rise;
+    const py = y + 30 - 26 * age;
 
+    ctx.globalAlpha = age < 0.45 ? 1 : 1 - (age - 0.45) / 0.55;
     ctx.lineWidth   = 3;
     ctx.strokeStyle = 'rgba(16,18,24,0.8)';
     ctx.strokeText(`-${b.dmg}`, px, py);
@@ -954,10 +1048,12 @@ function drawPhasePanel() {
     ctx.fillText(ph.label, x + 38, cy);
 
     let n = sim.counts[ph.key];
-    // the ready count follows the sweep instead of jumping to the total, so the
-    // panel and the board agree on how far through the phase you are
+    // counts follow the playback instead of jumping to the total, so the panel
+    // and the board agree on how far through the phase you are
     if (n !== undefined && current && ph.key === 'charge')
       n = sim.data.ready.filter(r => chargeProgress(r.order) > 0).length;
+    if (n !== undefined && current && ph.key === 'strike')
+      n = sim.data.blows.filter(b => strikeProgress(b.order) >= STRIKE_IMPACT).length;
 
     if (n !== undefined) {
       ctx.textAlign = 'right';
@@ -994,8 +1090,11 @@ function draw() {
       if (!card) { drawSlot(side, i); continue; }
       const { x, y } = slotPos(side, i);
       const lunge = lungeOffset(side, i);
-      drawCard(card, x + lunge.x, y + lunge.y,
+      const cx = x + lunge.x, cy = y + lunge.y;
+      drawCard(card, cx, cy,
         sel && sel.side === side && sel.from === 'field' && sel.index === i);
+      // dead but still on the board, and possibly still to swing
+      if (inPhase('strike') && displayHp(card) <= 0) drawDoomed(cx, cy);
     }
 
     drawDeck(side);
